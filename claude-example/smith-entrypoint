@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+#
+# smith-entrypoint — brings agent-smith up inside a Docker Sandbox, then execs
+# the agent (claude) as the foreground process under tini.
+#
+# This replaces agent-smith's installers/install.sh + launchd/systemd
+# supervisors entirely. Everything here is idempotent: the sandbox filesystem
+# and its docker images persist across `sbx stop`/`sbx run`, so a restart must
+# not redo work or fail on already-present state.
+#
+# Steps, in order:
+#   1. ensure /dev/net/tun exists   (the Kali container requires the device)
+#   2. wait for the sandbox's dockerd
+#   3. docker load the pre-baked tool images (only the ones actually missing)
+#   4. install the 35 skills into ~/.claude/  (done HERE, not at build time, so
+#      it lands after any home volume is attached)
+#   5. start the MCP SSE server and wait for it to listen
+#   6. exec "$@"
+set -uo pipefail
+
+SMITH_HOME="${SMITH_HOME:-/opt/agent-smith}"
+IMAGES_DIR="${SMITH_IMAGES_DIR:-/opt/smith-images}"
+MCP_PORT="${SMITH_MCP_PORT:-7778}"
+PYBIN="$SMITH_HOME/.venv/bin/python"
+
+# The cwd we inherit is the mounted workspace (sbx mounts it at the same
+# absolute path as on the host). Capture it before we cd anywhere: it becomes
+# PENTEST_TARGET_PATH, which is what the white-box scanners bind-mount as
+# /target:ro (mcp_server/_app.py:171) and what /codebase reads.
+WORKSPACE="$(pwd)"
+
+log()  { printf '[smith] %s\n' "$*" >&2; }
+warn() { printf '[smith] WARNING: %s\n' "$*" >&2; }
+
+# --------------------------------------------------------------------------
+# 1. /dev/net/tun
+#
+# tools/kali_runner.py:141 passes --device=/dev/net/tun:/dev/net/tun
+# unconditionally — there is no env var to skip it and no fallback, so without
+# the device `docker run` fails and every Kali-backed skill is dead.
+# --------------------------------------------------------------------------
+ensure_tun() {
+    [ -c /dev/net/tun ] && return 0
+    log "/dev/net/tun absent — creating it (needed by the Kali container)"
+    sudo -n modprobe tun 2>/dev/null || true
+    if [ ! -c /dev/net/tun ]; then
+        sudo -n mkdir -p /dev/net 2>/dev/null || true
+        sudo -n mknod /dev/net/tun c 10 200 2>/dev/null || true
+        sudo -n chmod 0666 /dev/net/tun 2>/dev/null || true
+    fi
+    if [ -c /dev/net/tun ]; then
+        log "/dev/net/tun ready"
+    else
+        warn "could not provide /dev/net/tun — kali() will fail to start the container."
+        warn "Try inside the sandbox: sudo modprobe tun"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# 2. dockerd readiness — the sandbox starts it for us (the base image carries
+#    LABEL com.docker.sandboxes.start-docker=true) but not necessarily before
+#    this script runs.
+# --------------------------------------------------------------------------
+wait_for_docker() {
+    local i max="${SMITH_DOCKER_WAIT:-60}"
+    [ "$max" = "0" ] && { log "docker wait skipped (SMITH_DOCKER_WAIT=0)"; return 1; }
+    for i in $(seq 1 "$max"); do
+        docker info >/dev/null 2>&1 && { log "docker daemon ready"; return 0; }
+        sleep 1
+    done
+    warn "docker daemon not reachable after ${max}s — scans and kali() will fail"
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# 3. Load the baked tool images.
+#
+# manifest.txt is written by build.sh as "<ref><TAB><file>" lines, where <ref>
+# is the EXACT reference the Python code inspects (tools/docker_runner.py:16-18).
+# Most are digest-pinned, so we check the ref rather than a marker file: that is
+# the same predicate agent-smith uses to decide whether to pull at runtime.
+# --------------------------------------------------------------------------
+load_images() {
+    local manifest="$IMAGES_DIR/manifest.txt"
+    if [ ! -f "$manifest" ]; then
+        log "no baked images (manifest.txt absent) — agent-smith will pull on demand"
+        return 0
+    fi
+    local ref file fallback loaded=0 present=0 failed=0 rewrote=0
+    while IFS=$'\t' read -r ref file fallback; do
+        [ -z "${ref:-}" ] && continue
+        case "$ref" in \#*) continue ;; esac
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+            present=$((present + 1))
+            continue
+        fi
+        if [ ! -f "$IMAGES_DIR/$file" ]; then
+            warn "manifest lists $file but it is not in the image"
+            failed=$((failed + 1))
+            continue
+        fi
+        log "loading $file"
+        if ! docker load -i "$IMAGES_DIR/$file" >/dev/null 2>&1; then
+            warn "docker load failed for $file"
+            failed=$((failed + 1))
+            continue
+        fi
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+            loaded=$((loaded + 1))
+            continue
+        fi
+        # The digest reference did not survive save/load on this daemon (classic
+        # overlay2 restores RepoTags only). The image IS here under the fallback
+        # tag, so repoint the source literal at it — otherwise
+        # tools/docker_runner.py:25-54 would try to pull and be blocked by the
+        # egress policy, which surfaces as an empty scan, not an error.
+        if [ -n "${fallback:-}" ] && [ "$fallback" != "-" ] \
+           && docker image inspect "$fallback" >/dev/null 2>&1; then
+            if grep -rlF -- "$ref" "$SMITH_HOME/tools" 2>/dev/null \
+                 | xargs -r sed -i "s|$ref|$fallback|g"; then
+                log "repinned $(basename "${ref%@sha256:*}") -> $fallback (digest ref lost in save/load)"
+                rewrote=$((rewrote + 1))
+                loaded=$((loaded + 1))
+                continue
+            fi
+        fi
+        warn "$file loaded but '$ref' is unresolvable and no usable fallback tag — agent-smith will try to pull it"
+        failed=$((failed + 1))
+    done < "$manifest"
+    log "tool images: $present present, $loaded loaded, $rewrote repinned, $failed unavailable"
+}
+
+# --------------------------------------------------------------------------
+# 4. Skills.
+#
+# Mirrors installers/install.sh:121-177: every skills/**/<name>/SKILL.md becomes
+# ~/.claude/skills/<leaf-name>/ (flattened, one dir per skill), pentester.md
+# becomes a slash command, and pentester-opencode is skipped. Set
+# SMITH_FORCE_SKILLS=1 to refresh copies that are already there.
+# --------------------------------------------------------------------------
+install_skills() {
+    local src_root="$SMITH_HOME/skills"
+    local dst_root="$HOME/.claude/skills"
+    [ -d "$src_root" ] || { warn "no skills tree at $src_root"; return 0; }
+
+    mkdir -p "$dst_root" "$HOME/.claude/commands" || {
+        warn "cannot write $HOME/.claude — skills not installed"
+        return 1
+    }
+
+    local installed=0 kept=0 skill_file skill_dir name dst
+    while IFS= read -r skill_file; do
+        skill_dir="$(dirname "$skill_file")"
+        name="$(basename "$skill_dir")"
+        [ "$name" = "pentester-opencode" ] && continue
+        dst="$dst_root/$name"
+        if [ -f "$dst/SKILL.md" ] && [ "${SMITH_FORCE_SKILLS:-0}" != "1" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        rm -rf "$dst"
+        mkdir -p "$dst"
+        cp -R "$skill_dir"/. "$dst"/ && installed=$((installed + 1))
+    done < <(find "$src_root" -mindepth 2 -maxdepth 3 -name SKILL.md 2>/dev/null)
+
+    if [ -f "$src_root/pentester.md" ]; then
+        cp -f "$src_root/pentester.md" "$HOME/.claude/commands/pentester.md" 2>/dev/null || true
+    fi
+
+    log "skills: $installed installed, $kept already present"
+}
+
+# --------------------------------------------------------------------------
+# 4b. Capability contract.
+#
+# With no sbx kit there is no `agentInstructions`, so the equivalent goes into
+# user-level memory. This matters more than it looks: the sandbox blocks whole
+# classes of technique, and the failure mode is SILENT — a proxy-refused
+# connection is indistinguishable from "the target is down", which the scan
+# engine would summarise as a clean result and close a coverage cell on.
+# --------------------------------------------------------------------------
+write_capability_contract() {
+    local dst="$HOME/.claude/CLAUDE.md"
+    [ "${SMITH_NO_CONTRACT:-0}" = "1" ] && return 0
+    mkdir -p "$HOME/.claude" 2>/dev/null || return 0
+    cat > "$dst" <<'CONTRACT'
+# Agent-Smith sandbox — environment contract
+
+You are running inside a Docker Sandbox microVM. agent-smith lives at
+`/opt/agent-smith` and its MCP server is already running; the mounted workspace
+is the TARGET codebase, not agent-smith.
+
+## Read this before planning a scan
+
+**Egress is deny-by-default.** Only hosts the operator has added with
+`sbx policy allow network <host>` are reachable. Everything else fails at the
+host proxy with a refused/reset connection.
+
+> A blocked connection is NOT evidence that the target is down or that a
+> vulnerability is absent. Never close a coverage cell as `tested_clean` on a
+> connection failure. Verify reachability first (`http(action='request')` or
+> httpx against the target); if it fails, tell the operator to run
+> `sbx policy allow network <host>` and record the blocker — do not infer a
+> clean result.
+
+**UDP and ICMP are blocked at the network layer and cannot be re-enabled.**
+- No ping, fping, traceroute, `nmap -sn`, hping3, arp-scan.
+- No UDP scans of any kind.
+- DNS from inside nested containers may fail for the same reason; prefer tools
+  that take an IP or run on the host network.
+
+**Port scans reflect the egress policy, not the target.** All outbound TCP is
+proxied, so raw SYN scans do not work. If you must port-scan, pass explicit
+connect-scan flags:
+- `scan(tool='nmap', target=..., flags='-Pn -sT -n')`
+- `scan(tool='naabu', target=..., flags='-scan-type c')`
+Treat the result as low-confidence. Prefer `httpx` and `nuclei`, which validate
+at the application layer and are unaffected.
+
+**No inbound connectivity.** Nothing outside can reach a listener in here, so
+reverse shells, chisel/ligolo tunnels, the Kali file-transfer port, and
+Metasploit handlers are unavailable. If a skill requires a callback, document why
+it could not be attempted instead of burning budget on it. Out-of-band (OAST)
+confirmation via interactsh still works — it is outbound-only.
+
+**This image is built `core + web` only.** The infra domain is NOT installed:
+netexec, impacket, hydra, medusa, smbmap, enum4linux-ng, bloodhound, responder,
+chisel and ligolo do not exist. Skills that depend on them — `/ad-assessment`,
+`/lateral-movement`, `/network-assess`, and the brute-force phases of
+`/credential-audit` — are out of scope here. Say so rather than retrying.
+
+In scope and fully supported: `/web-exploit`, `/api-security`, `/param-fuzz`,
+`/business-logic`, `/oauth-security`, `/saml-sso`, `/ssl-tls-audit`, `/codebase`,
+`/supply-chain`, `/aikido-triage`, `/analyze-cve`, `/osint` (passive sources are
+partly blocked — treat empty subdomain results as inconclusive).
+
+## White-box work
+
+`PENTEST_TARGET_PATH` points at the mounted workspace. Before any semgrep /
+trufflehog / `/codebase` work, call `session(action='set_codebase', options={'path': '<workspace path>'})`
+so the scanners analyse the target and not agent-smith's own source.
+
+## Where state lives
+
+`findings.json`, `coverage_matrix.json`, `session.json`, `artifacts/`, `pocs/`
+and `logs/` are all under `/opt/agent-smith`, which is outside the workspace.
+Reference them by absolute path.
+CONTRACT
+    log "capability contract written to $dst"
+}
+
+# --------------------------------------------------------------------------
+# 4c. Belt-and-braces MCP registration.
+#
+# The primary path is CMD's `--mcp-config /opt/agent-smith/.mcp.json`, which
+# needs no persisted state. This adds the user-scope registration as well, using
+# the same command installers/install.sh:73-75 runs.
+#
+# Why it is only a fallback: ~/.claude.json is sandbox-managed, so sbx may own or
+# replace it — Docker's docs say not to target it with kit files or install
+# commands. Letting the claude CLI write it at runtime is the supported route,
+# and if sbx clobbers it we lose nothing because --mcp-config still applies.
+# Non-fatal by design; set SMITH_NO_MCP_ADD=1 to skip.
+# --------------------------------------------------------------------------
+register_mcp_fallback() {
+    [ "${SMITH_NO_MCP_ADD:-0}" = "1" ] && return 0
+    command -v claude >/dev/null 2>&1 || return 0
+    if claude mcp list 2>/dev/null | grep -q '^pentest-agent'; then
+        log "pentest-agent already registered with the claude CLI"
+        return 0
+    fi
+    if claude mcp add --scope user --transport sse pentest-agent \
+            "http://127.0.0.1:${MCP_PORT}/sse" >/dev/null 2>&1; then
+        log "registered pentest-agent (user scope) as a fallback to --mcp-config"
+    else
+        log "could not add the user-scope registration; relying on --mcp-config"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# 5. The MCP server.
+#
+# Started directly — no installers/run-mcp-server.sh, no launchd, no systemd.
+# The launcher's only real job is discovering the Poetry venv interpreter, and
+# in this image we know it: /opt/agent-smith/.venv/bin/python. cwd must be the
+# repo root because core/paths.py resolves every state file relative to it.
+# --------------------------------------------------------------------------
+mcp_listening() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$MCP_PORT") >/dev/null 2>&1
+}
+
+start_mcp() {
+    if mcp_listening; then
+        log "MCP server already listening on 127.0.0.1:$MCP_PORT"
+        return 0
+    fi
+    if [ ! -x "$PYBIN" ]; then
+        warn "$PYBIN missing — the image is broken; MCP server not started"
+        return 1
+    fi
+
+    mkdir -p "$SMITH_HOME/logs" "${TMPDIR:-/tmp}" 2>/dev/null || true
+    log "starting MCP server on 127.0.0.1:$MCP_PORT (target path: $WORKSPACE)"
+    (
+        cd "$SMITH_HOME" || exit 1
+        PYTHONPATH="$SMITH_HOME" \
+        PENTEST_TARGET_PATH="${PENTEST_TARGET_PATH:-$WORKSPACE}" \
+            nohup "$PYBIN" -m mcp_server \
+                --transport sse --host 127.0.0.1 --port "$MCP_PORT" \
+                >>"$SMITH_HOME/logs/mcp_sse.log" 2>&1 &
+        echo $! > "$SMITH_HOME/logs/mcp_sse.pid"
+    )
+
+    local i
+    for i in $(seq 1 45); do
+        mcp_listening && { log "MCP server ready"; return 0; }
+        sleep 1
+    done
+
+    warn "MCP server did not come up within 45s. Last 20 log lines:"
+    tail -20 "$SMITH_HOME/logs/mcp_sse.log" 2>/dev/null | sed 's/^/[smith]   /' >&2
+    warn "Claude Code will start anyway so you can debug: check $SMITH_HOME/logs/mcp_sse.log"
+    return 1
+}
+
+# --------------------------------------------------------------------------
+main() {
+    ensure_tun
+    if wait_for_docker; then
+        load_images
+    fi
+    install_skills
+    write_capability_contract
+    register_mcp_fallback
+    start_mcp
+
+    # Export for any interactive shell the operator opens via `sbx exec`.
+    export PENTEST_TARGET_PATH="${PENTEST_TARGET_PATH:-$WORKSPACE}"
+
+    log "handing off to: $*"
+    exec "$@"
+}
+
+main "$@"

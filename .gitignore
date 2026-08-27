@@ -1,0 +1,127 @@
+# ============================================================================
+# smith-docker-sandbox
+#
+# Ordered by how much damage committing the thing would do, worst first.
+# ============================================================================
+
+# ── Engagement output — the real leak risk in a pentest repo ────────────────
+# If anyone ever runs a scan with this repo as the working directory, or copies
+# results here, these files carry live findings: discovered credentials, session
+# tokens, internal hostnames, request/response bodies and client-identifying
+# data. Mirrors agent-smith's own .gitignore so the two can't disagree.
+findings.json
+coverage_matrix.json
+session.json
+session_cost.json
+quick_log.json
+qa_state.json
+steering_queue.json
+wishlist_queue.json
+recovery_latest.json
+adjudication_log.jsonl
+pentest_metrics.jsonl
+gh-issues.md
+artifacts/
+pocs/
+threat-model/
+logs/
+smith-output/
+*.sig
+
+# ── Secrets ────────────────────────────────────────────────────────────────
+# .env matters twice over here: agent-smith reads it from its repo root AND
+# .env values OVERRIDE the inherited environment, so a stray one both leaks and
+# silently clobbers keys passed via `sbx run -e`.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*.kdbx
+credentials
+credentials.json
+secrets.yml
+secrets.yaml
+.netrc
+.npmrc
+.dockerconfigjson
+# agent-smith's per-run shared secrets, in case a logs/ tree is ever copied in
+.kali_api_token
+.msf_api_secret
+.integrity_key
+dashboard.token
+mobsf.key
+
+# ── Build output — multi-GB and architecture-specific: rebuild, don't share ──
+# The saved tool-image tarballs (Kali alone is ~4 GB compressed) and the
+# distributable template tar. build.sh regenerates all of it.
+*.tar
+*.tar.gz
+*.tgz
+claude-example/images/*
+!claude-example/images/.gitkeep
+# The pinned agent-smith clone build.sh caches for the Kali build context.
+.build-cache/
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# ── Node ───────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Logs and temp ──────────────────────────────────────────────────────────
+*.log
+*.pid
+tmp/
+.tmp/
+
+# ── OS noise ───────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.fuse_hidden*
+.directory
+.nfs*
+
+# ── Editors ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project

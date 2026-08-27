@@ -1,0 +1,87 @@
+schemaVersion: "2"
+kind: mixin
+name: smith-bringup
+displayName: Agent-Smith bring-up
+description: >
+  Starts the pentest-agent MCP server inside the sandbox and registers it with
+  Claude Code. Required because sbx launches the agent itself and does not use
+  the template image's ENTRYPOINT/CMD, so smith-entrypoint never runs on its own.
+
+setup:
+  startup:
+    # ---------------------------------------------------------------------
+    # /dev/net/tun — tools/kali_runner.py:141 passes
+    # --device=/dev/net/tun:/dev/net/tun unconditionally. No env var skips it and
+    # there is no fallback: without the device `docker run` fails and every
+    # Kali-backed skill (most of the toolchain) is dead. /dev is a fresh tmpfs in
+    # each sandbox, so this cannot be baked into the image.
+    # ---------------------------------------------------------------------
+    - description: "Create /dev/net/tun for the Kali container"
+      user: "0"
+      command:
+        - sh
+        - -c
+        - '[ -c /dev/net/tun ] || { modprobe tun 2>/dev/null || true; mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 0666 /dev/net/tun; }; ls -l /dev/net/tun || true'
+
+    # ---------------------------------------------------------------------
+    # The bring-up itself. Invoked with NO arguments, which makes
+    # smith-entrypoint run setup only and exit 0 instead of exec'ing an agent:
+    #   wait for dockerd -> docker load the baked tool images (only the missing
+    #   ones) -> install the 35 skills -> write the capability contract ->
+    #   register pentest-agent with the claude CLI -> start the MCP SSE server
+    #   on 127.0.0.1:7778 -> block until it is listening.
+    #
+    # Deliberately BLOCKING, not backgrounded: Claude Code resolves its MCP
+    # servers at launch, so a server that is not listening yet means a whole
+    # session with no pentest tools — which presents as the model "refusing" to
+    # use them rather than as an error.
+    # ---------------------------------------------------------------------
+    - description: "Start the pentest-agent MCP server and install skills"
+      user: "1000"
+      command: ["/usr/local/bin/smith-entrypoint"]
+
+environment:
+  variables:
+    # Redundant with the image's ENV, but free — and if sbx ignores the image
+    # ENTRYPOINT it may ignore other image config too.
+    SMITH_HOME: /opt/agent-smith
+    SMITH_MCP_PORT: "7778"
+    TMPDIR: /opt/agent-smith/.tmp
+    # sbx --publish cannot forward to a loopback-only listener, and
+    # core/api_server/serve.py:133 defaults DASHBOARD_HOST to 127.0.0.1.
+    DASHBOARD_HOST: 0.0.0.0
+
+permissions:
+  network:
+    allow:
+      # Only what the sandbox itself needs. Engagement targets are added
+      # per-run with `sbx policy allow network <host>` and are never baked in —
+      # the allow-list IS the scope.
+      - "github.com"                      # nuclei -ut template fetch on first run
+      - "raw.githubusercontent.com"
+      - "objects.githubusercontent.com"
+    deny:
+      # The agent runs offensive tooling; do not let it reach the host's cloud
+      # instance credentials. Remove only for a deliberate, authorized IMDS test.
+      - "169.254.169.254"
+
+agentInstructions:
+  content: |
+    agent-smith is installed at /opt/agent-smith and its MCP server (five tools:
+    scan, kali, http, report, session) is already running on 127.0.0.1:7778.
+
+    Read ~/.claude/CLAUDE.md before planning a scan — it is the environment
+    contract for this sandbox. The critical points:
+
+    - Egress is deny-by-default. A refused connection is NOT evidence the target
+      is down or clean. Never close a coverage cell on a connection failure; ask
+      the operator to run `sbx policy allow network <host>`.
+    - UDP and ICMP are permanently blocked. nmap needs flags='-Pn -sT -n' and
+      naabu needs flags='-scan-type c'; ping/traceroute/UDP scans cannot work.
+    - No inbound connectivity: reverse shells, tunnels and Metasploit handlers
+      are unreachable. OAST/interactsh still works (outbound only).
+    - This image is core+web only. netexec, impacket, hydra, smbmap,
+      enum4linux-ng, bloodhound, chisel and ligolo are NOT installed, so
+      /ad-assessment, /lateral-movement and /network-assess are out of scope.
+    - All state (findings.json, coverage_matrix.json, artifacts/, pocs/) lives
+      under /opt/agent-smith, not in the workspace. The workspace is the target.

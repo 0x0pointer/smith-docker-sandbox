@@ -1,0 +1,23 @@
+# ── build output (never commit: multi-GB and machine-specific) ──────────────
+# The saved tool-image tarballs and the distributable template tar. These are
+# 1-5 GB each and are architecture-specific, so they are rebuilt, not shared.
+images/*.tar.gz
+images/*.tar
+images/manifest.txt
+*.tar
+
+# The pinned agent-smith clone that build.sh caches for the Kali build context.
+.build-cache/
+
+# ── secrets: never commit, even though nothing here generates one ───────────
+# agent-smith reads .env from its repo root and .env values OVERRIDE the
+# inherited environment, so a stray .env is both a leak risk and a footgun.
+.env
+.env.*
+*.pem
+*.key
+
+# ── noise ──────────────────────────────────────────────────────────────────
+*.log
+.DS_Store
+._*
